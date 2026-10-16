@@ -1,81 +1,97 @@
-#include <unistd.h>
-#include <stdio.h>
-#include <iostream>
+#include <cerrno>
+#include <climits>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
-#include <errno.h>
-#include <math.h>
 #include <ctime>
-#include <curand.h>
+#include <iostream>
 #include <curand_kernel.h>
 
-__global__ void init(float time, curandState_t* states){
-    int threadID = threadIdx.x + blockDim.x * blockIdx.x; 
-    curand_init ( time,  threadID, 0, &states[threadID] );
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                       \
+        cudaError_t err_ = (call);                                             \
+        if (err_ != cudaSuccess) {                                             \
+            std::fprintf(stderr, "CUDA error %s at %s:%d: %s\n",               \
+                         cudaGetErrorName(err_), __FILE__, __LINE__,           \
+                         cudaGetErrorString(err_));                            \
+            std::exit(EXIT_FAILURE);                                           \
+        }                                                                      \
+    } while (0)
+
+__global__ void init(unsigned long long seed, curandState_t *states, long long n) {
+    long long threadID = threadIdx.x + static_cast<long long>(blockDim.x) * blockIdx.x;
+    if (threadID < n) {
+        curand_init(seed, threadID, 0, &states[threadID]);
+    }
 }
 
-__global__ void getRandNums(curandState *states, int* randNums) {
-    int threadID = threadIdx.x + blockDim.x * blockIdx.x; 
+__global__ void getRandNums(curandState_t *states, int *randNums, long long n) {
+    long long threadID = threadIdx.x + static_cast<long long>(blockDim.x) * blockIdx.x;
+    if (threadID >= n) {
+        return;
+    }
     float x = curand_uniform(&states[threadID]);
     float y = curand_uniform(&states[threadID]);
-    float dx = abs(.5 - x);
-    float dy = abs(.5 - y);
-    float distance = sqrt ( dx * dx + dy * dy);
+    float dx = fabsf(0.5f - x);
+    float dy = fabsf(0.5f - y);
+    float distance = sqrtf(dx * dx + dy * dy);
 
-    if (.5 > distance){
-        randNums[threadID] = 1;
-    }
-    else {
-        randNums[threadID] = 0;
-    }
-
+    randNums[threadID] = (distance < 0.5f) ? 1 : 0;
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
+    // default number of blocks if not specified via command line
+    long blocks = 256;
+    // number of threads per block, max is 1024 on all supported GPUs
+    const int bThreads = 512;
 
-    //default number of blocks if not specified via command line
-    long int blocks = 256;
-    //number of threads per block, max is 1024 on an nvidia m40
-    int bThreads = 512;
-    
-    long int arg1 = 0;
-    errno = 0;
-    char *endIn = NULL;
-    
-    if ( argc >= 2){
-        arg1 = strtol(argv[1], &endIn, 10);
-        if (arg1 != 0 || errno == 0 ){
-            blocks = arg1;  
+    if (argc >= 2) {
+        errno = 0;
+        char *endIn = NULL;
+        long arg1 = std::strtol(argv[1], &endIn, 10);
+        if (errno != 0 || endIn == argv[1] || *endIn != '\0' || arg1 <= 0 || arg1 > INT_MAX) {
+            std::cerr << "Invalid number of blocks '" << argv[1]
+                      << "', expected an integer between 1 and " << INT_MAX << std::endl;
+            return EXIT_FAILURE;
         }
+        blocks = arg1;
     } else {
         std::cout << "Number of blocks not specified, using default 256" << std::endl;
     }
-    
-    //total threads is needed for size of the arrays and later for monte-carlo approximation
-    int tThreads = blocks * bThreads;
+
+    int device = 0;
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    std::cout << "Device " << device << ": " << prop.name << " (compute capability "
+              << prop.major << "." << prop.minor << ")" << std::endl;
+
+    // total threads is needed for size of the arrays and later for monte-carlo approximation
+    const long long tThreads = static_cast<long long>(blocks) * bThreads;
     std::cout << "Blocks: " << blocks << " Total Threads: " << tThreads << std::endl;
 
-    curandState_t *states;
-    cudaMallocManaged(&states, tThreads * sizeof(curandState_t));
-    init<<<blocks, bThreads>>>(time(0), states);
+    curandState_t *states = NULL;
+    CUDA_CHECK(cudaMallocManaged(&states, tThreads * sizeof(curandState_t)));
+    init<<<blocks, bThreads>>>(static_cast<unsigned long long>(std::time(NULL)), states, tThreads);
+    CUDA_CHECK(cudaGetLastError());
 
-    int* randNums;
-    cudaMallocManaged(&randNums, tThreads * sizeof(long int));
-    getRandNums<<<blocks, bThreads>>>(states, randNums);
+    int *randNums = NULL;
+    CUDA_CHECK(cudaMallocManaged(&randNums, tThreads * sizeof(int)));
+    getRandNums<<<blocks, bThreads>>>(states, randNums, tThreads);
+    CUDA_CHECK(cudaGetLastError());
 
-    cudaDeviceSynchronize();
-    
-    int insidePoints = 0;
-    for (int i = 0; i < tThreads; i++) {
-        if (randNums[i] == 1){
-            insidePoints++;
-        }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    long long insidePoints = 0;
+    for (long long i = 0; i < tThreads; i++) {
+        insidePoints += randNums[i];
     }
 
-    float pi = 4 * (static_cast<double>(insidePoints) / static_cast<double>(tThreads));
+    double pi = 4.0 * (static_cast<double>(insidePoints) / static_cast<double>(tThreads));
     std::cout << "Pi is approx: " << pi << std::endl;
-    
-    cudaFree(states);
-    cudaFree(randNums);
 
-    return 0;
+    CUDA_CHECK(cudaFree(states));
+    CUDA_CHECK(cudaFree(randNums));
+
+    return EXIT_SUCCESS;
 }
